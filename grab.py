@@ -172,7 +172,7 @@ def login(page: Page):
         dump_debug(page, "login_timeout_pos")
         raise RuntimeError("Não houve redirecionamento esperado para o SGD após login.")
 
-def open_consultar_varios_objetos(page: Page):
+def open_consultar_varios_objetos(page: Page) -> Page:
     print("[INFO] Abrindo menu 'Pesquisar Objeto'…")
     try_call_opcoes(page)
 
@@ -187,15 +187,28 @@ def open_consultar_varios_objetos(page: Page):
         raise RuntimeError("Menu 'Pesquisar Objeto' não localizado.")
 
     print("[INFO] Selecionando 'Consultar vários objetos'…")
-    if not click_first(page, [
+    found = find_first_locator(page, [
         "xpath=//a[contains(translate(.,'ÁÀÃÂÉÈÊÍÌÎÓÒÔÕÚÙÛÇVARIOS','aaaaeeeiiioooouuucvarios'),'consultar varios objetos')]",
         "xpath=//button[contains(translate(.,'ÁÀÃÂÉÈÊÍÌÎÓÒÔÕÚÙÛÇVARIOS','aaaaeeeiiioooouuucvarios'),'consultar varios objetos')]",
         "xpath=//a[contains(.,'Consultar Vários Objetos')]",
         "xpath=//a[contains(.,'Consultar vários objetos')]",
         "xpath=//*[self::a or self::span or self::button][contains(.,'Consultar')][contains(.,'objet')]",
-    ], timeout_ms=8000):
+    ], timeout_ms=8000)
+    if not found:
         dump_debug(page, "consultar_varios_nao_encontrado")
         raise RuntimeError("Link 'Consultar vários objetos' não localizado.")
+
+    fr, sel = found
+    with page.context.expect_page() as new_page_info:
+        fr.locator(sel).first.click(timeout=TIMEOUT_MS)
+    new_page = new_page_info.value
+
+    try:
+        new_page.wait_for_load_state("load", timeout=TIMEOUT_MS)
+    except PWTimeoutError:
+        pass
+
+    return new_page
 
 def pesquisar_codigos(page: Page, codes: List[str]):
     print("[INFO] Localizando área de texto para múltiplos objetos…")
@@ -379,7 +392,7 @@ def main():
             except PWTimeoutError:
                 pass
 
-            open_consultar_varios_objetos(page)
+            page = open_consultar_varios_objetos(page)
             pesquisar_codigos(page, CODES)
             baixar_ars(page, CODES)
 
