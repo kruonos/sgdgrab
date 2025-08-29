@@ -4,18 +4,19 @@ from selenium.webdriver.common.by import By
 from selenium.webdriver.common.keys import Keys
 from selenium.webdriver.support.ui import WebDriverWait
 from selenium.webdriver.support import expected_conditions as EC
-from selenium.webdriver.common.action_chains import ActionChains
 from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException, SessionNotCreatedException
 from webdriver_manager.chrome import ChromeDriverManager
 from pathlib import Path
-import time, re, os
-from pywinauto import Desktop, keyboard
+import time, os
+import requests
 
 # ===== Config =====
 PROFILE_DIR  = r"C:\Users\gilbe\sgd_selenium_profile"   # perfil LIMPO só do Selenium
 TARGET       = "https://sgd.correios.com.br/sgd/app/"
+DOWNLOAD_DIR = Path("downloads")
 
 os.makedirs(PROFILE_DIR, exist_ok=True)
+DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
 
 # Limpa travas se sobrou algo do último crash
 for f in ["SingletonLock", "SingletonCookie", "SingletonSocket", "SingletonSemaphore"]:
@@ -84,24 +85,6 @@ campo_codigos = wait.until(EC.presence_of_element_located((By.ID, "txtAreaObjeto
 campo_codigos.clear()
 campo_codigos.send_keys(codes_text)
 wait.until(EC.element_to_be_clickable((By.PARTIAL_LINK_TEXT, "Pesquisar"))).click()
-
-# ...existing code...
-from pywinauto.keyboard import send_keys
-
-def press_ctrl_s_then_enter(timeout=20) -> bool:
-    """Brings up Save As with Ctrl+S and confirms with Enter. No renaming, no path typing."""
-    try:
-        # Ctrl+S in the browser window
-        ActionChains(driver).key_down(Keys.CONTROL).send_keys('s').key_up(Keys.CONTROL).perform()
-        time.sleep(1)  # Wait for Save As dialog
-        # Press Enter to confirm Save As using pywinauto
-        send_keys('{ENTER}')
-        time.sleep(1)  # Wait for file to save
-        return True
-    except Exception as e:
-        print(f"[ERROR] Failed to save file: {e}")
-        return False
-# ...existing code...
   
 def open_and_quick_save_all_ars():
     saved, skipped = 0, 0
@@ -143,10 +126,19 @@ def open_and_quick_save_all_ars():
         try:
             driver.switch_to.window(new_handle)
             time.sleep(0.8)  # let image load
-            ok = press_ctrl_s_then_enter(timeout=20)
-            if ok:
-                saved += 1
-            else:
+            try:
+                src = driver.find_element(By.TAG_NAME, "img").get_attribute("src")
+                response = requests.get(src)
+                if response.ok:
+                    ext = Path(src.split("?")[0]).suffix or ".png"
+                    filename = f"ar_{int(time.time()*1000)}{ext}"
+                    path = DOWNLOAD_DIR / filename
+                    with open(path, "wb") as f:
+                        f.write(response.content)
+                    saved += 1
+                else:
+                    skipped += 1
+            except Exception:
                 skipped += 1
         finally:
             try:
