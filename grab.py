@@ -22,7 +22,7 @@ import time
 from pathlib import Path
 from typing import List, Optional, Tuple
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError, Page, Frame, Response
+from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError, Page, Frame
 
 LOGIN_URL = "https://sgd.correios.com.br/sgd/app/"  # solicitado por você
 # ⚠️ O ponto faz parte do usuário
@@ -172,7 +172,7 @@ def login(page: Page):
         dump_debug(page, "login_timeout_pos")
         raise RuntimeError("Não houve redirecionamento esperado para o SGD após login.")
 
-def open_consultar_varios_objetos(page: Page):
+def open_consultar_varios_objetos(page: Page) -> Page:
     print("[INFO] Abrindo menu 'Pesquisar Objeto'…")
     try_call_opcoes(page)
 
@@ -187,15 +187,28 @@ def open_consultar_varios_objetos(page: Page):
         raise RuntimeError("Menu 'Pesquisar Objeto' não localizado.")
 
     print("[INFO] Selecionando 'Consultar vários objetos'…")
-    if not click_first(page, [
+    found = find_first_locator(page, [
         "xpath=//a[contains(translate(.,'ÁÀÃÂÉÈÊÍÌÎÓÒÔÕÚÙÛÇVARIOS','aaaaeeeiiioooouuucvarios'),'consultar varios objetos')]",
         "xpath=//button[contains(translate(.,'ÁÀÃÂÉÈÊÍÌÎÓÒÔÕÚÙÛÇVARIOS','aaaaeeeiiioooouuucvarios'),'consultar varios objetos')]",
         "xpath=//a[contains(.,'Consultar Vários Objetos')]",
         "xpath=//a[contains(.,'Consultar vários objetos')]",
         "xpath=//*[self::a or self::span or self::button][contains(.,'Consultar')][contains(.,'objet')]",
-    ], timeout_ms=8000):
+    ], timeout_ms=8000)
+    if not found:
         dump_debug(page, "consultar_varios_nao_encontrado")
         raise RuntimeError("Link 'Consultar vários objetos' não localizado.")
+
+    fr, sel = found
+    with page.context.expect_page() as new_page_info:
+        fr.locator(sel).first.click(timeout=TIMEOUT_MS)
+    new_page = new_page_info.value
+
+    try:
+        new_page.wait_for_load_state("load", timeout=TIMEOUT_MS)
+    except PWTimeoutError:
+        pass
+
+    return new_page
 
 def pesquisar_codigos(page: Page, codes: List[str]):
     print("[INFO] Localizando área de texto para múltiplos objetos…")
@@ -229,54 +242,13 @@ def pesquisar_codigos(page: Page, codes: List[str]):
         dump_debug(page, "tabela_resultados_nao_apareceu")
         raise RuntimeError("Tabela de resultados não apareceu após a pesquisa.")
 
-def wait_and_save_pdf(response_bucket: List[Response], code: str, timeout_ms: int = 20000) -> bool:
-    """Espera por uma resposta PDF recente e salva como <code>.pdf."""
-    # Polling simples do balde de respostas recentes
-    deadline = time.time() + timeout_ms / 1000.0
-    last_seen_len = len(response_bucket)
-    while time.time() < deadline:
-        # Verifica se houve novas respostas
-        if len(response_bucket) > last_seen_len:
-            for resp in response_bucket[last_seen_len:]:
-                try:
-                    ctype = (resp.headers or {}).get("content-type", "")
-                except Exception:
-                    ctype = ""
-                if "application/pdf" in ctype.lower():
-                    try:
-                        content = resp.body()
-                        out_path = DOWNLOAD_DIR / f"{code}.pdf"
-                        with open(out_path, "wb") as f:
-                            f.write(content)
-                        return True
-                    except Exception:
-                        pass
-            last_seen_len = len(response_bucket)
-        time.sleep(0.25)
-    return False
-
 def baixar_ars(page: Page, codes: List[str]):
     """
     Para cada código:
       - Procura um link com onclick="verArDigital('CODE')"
-      - Clica e captura o PDF via interceptação de resposta
-      - Salva em downloads_ar_sgd/<CODE>.pdf
+      - Clica e salva o PDF usando Ctrl+S com o nome sugerido pelo servidor
     """
     print("[INFO] Iniciando downloads dos ARs…")
-    # Balde para armazenar respostas (anexado ao contexto)
-    response_bucket: List[Response] = []
-
-    def on_response(resp: Response):
-        # Guarda respostas potencialmente úteis
-        try:
-            # só guardamos se suspeita de PDF para reduzir memória
-            ctype = (resp.headers or {}).get("content-type", "")
-            if "application/pdf" in ctype.lower():
-                response_bucket.append(resp)
-        except Exception:
-            pass
-
-    page.context.on("response", on_response)
 
     baixados = []
     ausentes = []
@@ -284,17 +256,14 @@ def baixar_ars(page: Page, codes: List[str]):
     for code in codes:
         print(f"[INFO] Código {code}: procurando link de AR Digital…")
 
-        # Seletor estrito no onclick do link
-        sel_strict = f"xpath=//a[contains(@class,'verArDigital') and contains(@onclick,\"verArDigital('{code}'\")]"
+        sel_strict = f'''xpath=//a[contains(@class,'verArDigital') and contains(@onclick,"verArDigital('{code}')")]'''
         found = find_first_locator(page, [sel_strict], timeout_ms=6000)
 
         if not found:
-            # fallback: buscar todos e filtrar atributo onclick no lado do cliente
             sel_loose = "xpath=//a[contains(@class,'verArDigital') and contains(@onclick,'verArDigital')]"
             found = find_first_locator(page, [sel_loose], timeout_ms=4000)
             if found:
                 fr, sel = found
-                # Filtra pelo atributo
                 elems = fr.locator(sel)
                 count = elems.count()
                 link_idx = None
@@ -303,10 +272,7 @@ def baixar_ars(page: Page, codes: List[str]):
                     if code in onclick:
                         link_idx = i
                         break
-                if link_idx is not None:
-                    link = elems.nth(link_idx)
-                else:
-                    link = None
+                link = elems.nth(link_idx) if link_idx is not None else None
             else:
                 link = None
         else:
@@ -318,45 +284,48 @@ def baixar_ars(page: Page, codes: List[str]):
             ausentes.append(code)
             continue
 
-        # Antes de clicar, limpa o balde de respostas para detectar o PDF correto
-        response_bucket.clear()
-
-        # Tenta clicar e capturar um PDF
+        existing_pages = page.context.pages[:]
         try:
             with page.expect_download(timeout=5000) as download_info:
                 link.click()
-            # Se o servidor for download direto, Playwright captura aqui:
             dl = download_info.value
-            out_path = DOWNLOAD_DIR / f"{code}.pdf"
+            out_path = DOWNLOAD_DIR / dl.suggested_filename
             dl.save_as(str(out_path))
-            print(f"[OK] {code}: PDF salvo (download direto).")
+            print(f"[OK] {code}: PDF salvo como {dl.suggested_filename}.")
             baixados.append(code)
             continue
         except Exception:
-            # Se abrir em nova aba/visualizador, tentamos via resposta PDF
+            pass
+
+        new_pages = [p for p in page.context.pages if p not in existing_pages]
+        if not new_pages:
+            print(f"[WARN] {code}: não foi possível abrir o AR Digital.")
+            ausentes.append(code)
+            continue
+
+        ar_page = new_pages[0]
+        try:
+            ar_page.wait_for_load_state("load", timeout=TIMEOUT_MS)
+        except PWTimeoutError:
+            pass
+
+        try:
+            with ar_page.expect_download() as download_info:
+                ar_page.keyboard.press("Control+S")
+            dl = download_info.value
+            out_path = DOWNLOAD_DIR / dl.suggested_filename
+            dl.save_as(str(out_path))
+            print(f"[OK] {code}: PDF salvo como {dl.suggested_filename}.")
+            baixados.append(code)
+        except Exception:
+            print(f"[WARN] {code}: falha ao salvar o PDF.")
+            ausentes.append(code)
+        finally:
             try:
-                link.click(timeout=5000)
+                ar_page.close()
             except Exception:
                 pass
 
-        # Pequena espera para rede disparar
-        ok = wait_and_save_pdf(response_bucket, code, timeout_ms=20000)
-        if ok:
-            print(f"[OK] {code}: PDF salvo (capturado via rede).")
-            baixados.append(code)
-        else:
-            print(f"[WARN] {code}: não foi possível capturar o PDF.")
-            ausentes.append(code)
-
-        # Fecha popups, se houver
-        if len(page.context.pages) > 1:
-            for p in page.context.pages[1:]:
-                try:
-                    p.close()
-                except Exception:
-                    pass
-
-    # Resumo
     print("\n== AR Digital baixado para ==", DOWNLOAD_DIR)
     for c in baixados:
         print("  ✓", c)
@@ -379,7 +348,7 @@ def main():
             except PWTimeoutError:
                 pass
 
-            open_consultar_varios_objetos(page)
+            page = open_consultar_varios_objetos(page)
             pesquisar_codigos(page, CODES)
             baixar_ars(page, CODES)
 
