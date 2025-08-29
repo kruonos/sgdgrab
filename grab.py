@@ -1,407 +1,171 @@
-# sgd_ar_playwright.py
-# Requisitos:
-#   pip install playwright
-#   python -m playwright install
-#
-# Uso:
-#   python sgd_ar_playwright.py
-#
-# Observações:
-# - HEADLESS=False para depurar (visualizar o navegador). Após estabilizar, pode usar True.
-# - O script tenta:
-#     1) Detectar/abrir tela de login (inclusive dentro de iframes).
-#     2) Preencher usuário/senha e submeter.
-#     3) Abrir "Pesquisar Objeto" -> "Consultar vários objetos".
-#     4) Colar a lista de códigos, pesquisar.
-#     5) Para cada código, clicar no "Ver AR Digital" e salvar o PDF.
-# - Se algum passo falhar, são gerados HTML/PNG de depuração em downloads_ar_sgd/.
-
-import os
-import re
-import time
+from selenium import webdriver
+from selenium.webdriver.chrome.service import Service
+from selenium.webdriver.common.by import By
+from selenium.webdriver.common.keys import Keys
+from selenium.webdriver.support.ui import WebDriverWait
+from selenium.webdriver.support import expected_conditions as EC
+from selenium.webdriver.common.action_chains import ActionChains
+from selenium.common.exceptions import TimeoutException, ElementClickInterceptedException, SessionNotCreatedException
+from webdriver_manager.chrome import ChromeDriverManager
 from pathlib import Path
-from typing import List, Optional, Tuple
+import time, re, os
+from pywinauto import Desktop, keyboard
 
-from playwright.sync_api import sync_playwright, TimeoutError as PWTimeoutError, Page, Frame, Response
+# ===== Config =====
+PROFILE_DIR  = r"C:\Users\gilbe\sgd_selenium_profile"   # perfil LIMPO só do Selenium
+TARGET       = "https://sgd.correios.com.br/sgd/app/"
 
-LOGIN_URL = "https://sgd.correios.com.br/sgd/app/"  # solicitado por você
-# ⚠️ O ponto faz parte do usuário
-USERNAME = os.getenv("SGD_USER", "gpp159753.")
-PASSWORD = os.getenv("SGD_PASS", "C159@753")
+os.makedirs(PROFILE_DIR, exist_ok=True)
 
-CODES = [
-    "YA259824691BR",
-    "YA259825184BR",
-    "YA259823912BR",
-    "YA259826984BR",
-    "YA259825900BR",
-    "YA259822421BR",
-    "YA259822072BR",
-    "YA259821094BR",
-]
+# Limpa travas se sobrou algo do último crash
+for f in ["SingletonLock", "SingletonCookie", "SingletonSocket", "SingletonSemaphore"]:
+    p = Path(PROFILE_DIR, f)
+    if p.exists():
+        try: p.unlink()
+        except Exception as e:
+            print(f"Failed to remove {p}: {e}")
 
-DOWNLOAD_DIR = Path.cwd() / "downloads_ar_sgd"
-DOWNLOAD_DIR.mkdir(parents=True, exist_ok=True)
+# ===== Browser =====
+options = webdriver.ChromeOptions()
+options.add_argument(fr"--user-data-dir={PROFILE_DIR}")
+options.add_argument("--no-first-run")
+options.add_argument("--no-default-browser-check")
+options.add_argument("--disable-backgrounding-occluded-windows")
+options.add_argument("--disable-features=Translate,MediaRouter")
+options.add_argument("--disable-popup-blocking")
 
-HEADLESS = False
-TIMEOUT_MS = 30000  # 30s por espera
+service = Service(ChromeDriverManager().install())
+try:
+    driver = webdriver.Chrome(service=service, options=options)
+except SessionNotCreatedException:
+    print("[ERRO] Falha ao iniciar o Chrome. Feche o Chrome, use perfil dedicado e atualize o navegador.")
+    raise
 
-def dump_debug(page_or_frame, name: str):
-    """Salva HTML e PNG do contexto atual para depuração."""
+wait = WebDriverWait(driver, 25)
+
+# ===== Acessa & Login =====
+driver.get(TARGET)
+try:
+    wait.until(EC.url_contains("sgd.correios.com.br"))
+except TimeoutException:
+    driver.execute_script("window.location.href = arguments[0];", TARGET)
+    wait.until(EC.url_contains("sgd.correios.com.br"))
+
+wait.until(EC.element_to_be_clickable((By.CLASS_NAME, "entrar"))).click()
+driver.find_element(By.ID, "username").send_keys("gpp159753.")
+pwd = driver.find_element(By.ID, "password")
+pwd.send_keys("C159@753")
+pwd.send_keys(Keys.RETURN)
+
+# ===== Menu -> Consulta Objetos =====
+wait.until(EC.element_to_be_clickable((By.ID, "nav-menu"))).click()
+wait.until(EC.element_to_be_clickable((By.CLASS_NAME, "expandir"))).click()
+wait.until(EC.element_to_be_clickable((By.LINK_TEXT, "Consulta Objetos"))).click()
+wait.until(EC.element_to_be_clickable((By.CLASS_NAME, "opcoes"))).click()
+wait.until(EC.element_to_be_clickable((By.ID, "chkConsultarVariosObjetos"))).click()
+
+# ===== Entrada dos códigos via terminal =====
+print("Paste up to 200 codes (space or newline separated).")
+print("Press ENTER on an empty line to finish.\n")
+
+codes = []
+while True:
+    line = input()
+    if not line: break
+    codes.extend(line.split())
+    if len(codes) >= 200: break
+
+codes = codes[:200]
+print(f"\nYou entered {len(codes)} codes.")
+codes_text = "\n".join(codes)
+
+# ===== Preenche campo e pesquisa =====
+campo_codigos = wait.until(EC.presence_of_element_located((By.ID, "txtAreaObjetos")))
+campo_codigos.clear()
+campo_codigos.send_keys(codes_text)
+wait.until(EC.element_to_be_clickable((By.PARTIAL_LINK_TEXT, "Pesquisar"))).click()
+
+# ...existing code...
+from pywinauto.keyboard import send_keys
+
+def press_ctrl_s_then_enter(timeout=20) -> bool:
+    """Brings up Save As with Ctrl+S and confirms with Enter. No renaming, no path typing."""
     try:
-        page = page_or_frame.page if hasattr(page_or_frame, "page") else page_or_frame
-        html_path = DOWNLOAD_DIR / f"{name}.html"
-        png_path = DOWNLOAD_DIR / f"{name}.png"
-        html = page.content()
-        with open(html_path, "w", encoding="utf-8", errors="ignore") as f:
-            f.write(html)
-        page.screenshot(path=str(png_path), full_page=True)
-        print(f"[DEBUG] URL: {page.url}")
-        print(f"[DEBUG] Salvos: {html_path} e {png_path}")
+        # Ctrl+S in the browser window
+        ActionChains(driver).key_down(Keys.CONTROL).send_keys('s').key_up(Keys.CONTROL).perform()
+        time.sleep(1)  # Wait for Save As dialog
+        # Press Enter to confirm Save As using pywinauto
+        send_keys('{ENTER}')
+        time.sleep(1)  # Wait for file to save
+        return True
     except Exception as e:
-        print(f"[DEBUG] Falha ao salvar debug {name}: {e}")
-
-def all_frames(page: Page) -> List[Frame]:
-    """Retorna a lista de frames (inclui o frame principal)."""
-    return [page.main_frame] + page.frames
-
-def find_first_locator(page: Page, selectors: List[str], timeout_ms: int = TIMEOUT_MS) -> Optional[Tuple[Frame, str]]:
-    """
-    Procura o primeiro seletor que exista/esteja visível em QUALQUER frame.
-    Retorna (frame, seletor_encontrado) ou None.
-    """
-    for sel in selectors:
-        for fr in all_frames(page):
-            try:
-                loc = fr.locator(sel).first
-                loc.wait_for(state="visible", timeout=timeout_ms)
-                return fr, sel
-            except PWTimeoutError:
-                continue
-            except Exception:
-                continue
-    return None
-
-def click_first(page: Page, selectors: List[str], timeout_ms: int = TIMEOUT_MS) -> bool:
-    """Clica no primeiro seletor disponível em qualquer frame."""
-    found = find_first_locator(page, selectors, timeout_ms=timeout_ms)
-    if not found:
+        print(f"[ERROR] Failed to save file: {e}")
         return False
-    fr, sel = found
+# ...existing code...
+  
+def open_and_quick_save_all_ars():
+    saved, skipped = 0, 0
     try:
-        fr.locator(sel).first.click(timeout=timeout_ms)
-        return True
-    except Exception:
-        return False
-
-def fill_first(page: Page, selectors: List[str], text: str, timeout_ms: int = TIMEOUT_MS) -> bool:
-    """Preenche o primeiro campo encontrado com o texto."""
-    found = find_first_locator(page, selectors, timeout_ms=timeout_ms)
-    if not found:
-        return False
-    fr, sel = found
-    try:
-        fr.locator(sel).first.fill(text, timeout=timeout_ms)
-        return True
-    except Exception:
-        return False
-
-def try_call_opcoes(page: Page):
-    """Tenta executar a função JS opcoes() em todos os frames (abre o menu 'Pesquisar Objeto')."""
-    for fr in all_frames(page):
-        try:
-            fr.evaluate("()=>{ if (typeof opcoes === 'function') opcoes(); }")
-            time.sleep(0.3)
-        except Exception:
-            pass
-
-def login(page: Page):
-    print("[INFO] Acessando URL de login…")
-    page.goto(LOGIN_URL, wait_until="domcontentloaded", timeout=TIMEOUT_MS)
-
-    # Algumas instâncias mostram um botão 'Acessar/Entrar/Login' antes do formulário
-    print("[INFO] Verificando front-door de acesso…")
-    click_first(page, [
-        "xpath=//a[contains(translate(.,'ACESSARENTARLOGIN','acessarentarlogin'),'acessar') or contains(translate(.,'ACESSARENTARLOGIN','acessarentarlogin'),'entrar') or contains(translate(.,'ACESSARENTARLOGIN','acessarentarlogin'),'login')]",
-        "xpath=//button[contains(translate(.,'ACESSARENTARLOGIN','acessarentarlogin'),'acessar') or contains(translate(.,'ACESSARENTARLOGIN','acessarentarlogin'),'entrar') or contains(translate(.,'ACESSARENTARLOGIN','acessarentarlogin'),'login')]",
-    ], timeout_ms=6000)
-
-    # Campos de usuário/senha (busca ampla por id/name/type)
-    print("[INFO] Procurando campos de usuário/senha…")
-    ok_user = fill_first(page, [
-        "input#username",
-        "input[name='username']",
-        "input[type='email']",
-        "input[type='text']",
-    ], USERNAME, timeout_ms=10000)
-
-    ok_pass = fill_first(page, [
-        "input#password",
-        "input[name='password']",
-        "input[type='password']",
-    ], PASSWORD, timeout_ms=10000)
-
-    if not ok_user or not ok_pass:
-        dump_debug(page, "login_campos_nao_encontrados")
-        raise RuntimeError("Campos de login não localizados (nem em iframes).")
-
-    # Botão de submit
-    print("[INFO] Enviando credenciais…")
-    if not click_first(page, [
-        "button[type='submit']",
-        "input[type='submit']",
-        "xpath=//button[contains(translate(.,'ENTRARLOGIN','entrarlogin'),'entrar') or contains(translate(.,'ENTRARLOGIN','entrarlogin'),'login')]",
-    ], timeout_ms=8000):
-        # Fallback: Enter no campo de senha
-        found = find_first_locator(page, [
-            "input#password",
-            "input[name='password']",
-            "input[type='password']",
-        ], timeout_ms=3000)
-        if not found:
-            dump_debug(page, "login_sem_submit")
-            raise RuntimeError("Não foi possível submeter o formulário de login.")
-        fr, sel = found
-        fr.locator(sel).press("Enter")
-
-    # Espera voltar para app SGD (pode haver redirecionamentos)
-    print("[INFO] Aguardando pós-login…")
-    try:
-        page.wait_for_url(re.compile(r"sgd.*"), timeout=TIMEOUT_MS)
-    except PWTimeoutError:
-        dump_debug(page, "login_timeout_pos")
-        raise RuntimeError("Não houve redirecionamento esperado para o SGD após login.")
-
-def open_consultar_varios_objetos(page: Page) -> Page:
-    print("[INFO] Abrindo menu 'Pesquisar Objeto'…")
-    try_call_opcoes(page)
-
-    if not click_first(page, [
-        "a[title='Pesquisar Objeto']",
-        "a.opcoes",
-        "xpath=//a[contains(@onclick,'opcoes()')]",
-        "xpath=//button[contains(translate(.,'PESQUISAROBJETO','pesquisarobjeto'),'pesquisar objeto')]",
-        "xpath=//a[.//i[contains(@class,'opcoes') or contains(@class,'fa-search')]]",
-    ], timeout_ms=8000):
-        dump_debug(page, "menu_pesquisar_nao_encontrado")
-        raise RuntimeError("Menu 'Pesquisar Objeto' não localizado.")
-
-    print("[INFO] Selecionando 'Consultar vários objetos'…")
-    found = find_first_locator(page, [
-        "xpath=//a[contains(translate(.,'ÁÀÃÂÉÈÊÍÌÎÓÒÔÕÚÙÛÇVARIOS','aaaaeeeiiioooouuucvarios'),'consultar varios objetos')]",
-        "xpath=//button[contains(translate(.,'ÁÀÃÂÉÈÊÍÌÎÓÒÔÕÚÙÛÇVARIOS','aaaaeeeiiioooouuucvarios'),'consultar varios objetos')]",
-        "xpath=//a[contains(.,'Consultar Vários Objetos')]",
-        "xpath=//a[contains(.,'Consultar vários objetos')]",
-        "xpath=//*[self::a or self::span or self::button][contains(.,'Consultar')][contains(.,'objet')]",
-    ], timeout_ms=8000)
-    if not found:
-        dump_debug(page, "consultar_varios_nao_encontrado")
-        raise RuntimeError("Link 'Consultar vários objetos' não localizado.")
-
-    fr, sel = found
-    with page.context.expect_page() as new_page_info:
-        fr.locator(sel).first.click(timeout=TIMEOUT_MS)
-    new_page = new_page_info.value
-
-    try:
-        new_page.wait_for_load_state("load", timeout=TIMEOUT_MS)
-    except PWTimeoutError:
+        wait.until(EC.presence_of_element_located((By.CSS_SELECTOR, "table, div.resultados, div.tabela")))
+    except TimeoutException:
         pass
 
-    return new_page
+    anchors = wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.verArDigital")))
+    for a in anchors:
+        style = (a.get_attribute("style") or "").replace(" ", "").lower()
+        onclick = a.get_attribute("onclick") or ""
+        if "opacity:0.2" in style or "verArDigital" not in onclick:
+            skipped += 1
+            continue
 
-def pesquisar_codigos(page: Page, codes: List[str]):
-    print("[INFO] Localizando área de texto para múltiplos objetos…")
-    ta_found = find_first_locator(page, [
-        "xpath=//textarea[contains(@id,'obj') or contains(@name,'obj') or contains(@placeholder,'objet')]",
-        "textarea",
-    ], timeout_ms=10000)
-    if not ta_found:
-        dump_debug(page, "textarea_nao_encontrada")
-        raise RuntimeError("Textarea de múltiplos objetos não encontrada.")
-    fr, sel = ta_found
-    fr.locator(sel).fill("\n".join(codes))
+        driver.execute_script("arguments[0].scrollIntoView({block:'center'});", a)
+        time.sleep(0.1)
 
-    print("[INFO] Acionando 'Pesquisar'…")
-    if not click_first(page, [
-        "xpath=//button[contains(translate(.,'PESQUISARBUSCAR','pesquisarbuscar'),'pesquisar')]",
-        "xpath=//button[contains(translate(.,'PESQUISARBUSCAR','pesquisarbuscar'),'buscar')]",
-        "xpath=//a[contains(@class,'btn') and (contains(.,'Pesquisar') or contains(.,'Buscar'))]",
-        "xpath=//input[@type='submit' and (contains(@value,'Pesquisar') or contains(@value,'Buscar'))]",
-    ], timeout_ms=8000):
-        dump_debug(page, "botao_pesquisar_nao_encontrado")
-        raise RuntimeError("Botão 'Pesquisar' não encontrado.")
-
-    print("[INFO] Aguardando a tabela de resultados…")
-    found = find_first_locator(page, [
-        "xpath=//table[contains(@class,'table')]",
-        "xpath=//div[contains(@class,'result') or contains(@id,'result')]//table",
-        "xpath=//*[self::table or self::div][contains(@class,'resultado') or contains(@id,'resultado')]//table",
-    ], timeout_ms=15000)
-    if not found:
-        dump_debug(page, "tabela_resultados_nao_apareceu")
-        raise RuntimeError("Tabela de resultados não apareceu após a pesquisa.")
-
-def wait_and_save_pdf(response_bucket: List[Response], code: str, timeout_ms: int = 20000) -> bool:
-    """Espera por uma resposta PDF recente e salva como <code>.pdf."""
-    # Polling simples do balde de respostas recentes
-    deadline = time.time() + timeout_ms / 1000.0
-    last_seen_len = len(response_bucket)
-    while time.time() < deadline:
-        # Verifica se houve novas respostas
-        if len(response_bucket) > last_seen_len:
-            for resp in response_bucket[last_seen_len:]:
-                try:
-                    ctype = (resp.headers or {}).get("content-type", "")
-                except Exception:
-                    ctype = ""
-                if "application/pdf" in ctype.lower():
-                    try:
-                        content = resp.body()
-                        out_path = DOWNLOAD_DIR / f"{code}.pdf"
-                        with open(out_path, "wb") as f:
-                            f.write(content)
-                        return True
-                    except Exception:
-                        pass
-            last_seen_len = len(response_bucket)
-        time.sleep(0.25)
-    return False
-
-def baixar_ars(page: Page, codes: List[str]):
-    """
-    Para cada código:
-      - Procura um link com onclick="verArDigital('CODE')"
-      - Clica e captura o PDF via interceptação de resposta
-      - Salva em downloads_ar_sgd/<CODE>.pdf
-    """
-    print("[INFO] Iniciando downloads dos ARs…")
-    # Balde para armazenar respostas (anexado ao contexto)
-    response_bucket: List[Response] = []
-
-    def on_response(resp: Response):
-        # Guarda respostas potencialmente úteis
+        before_handles = set(driver.window_handles)
         try:
-            # só guardamos se suspeita de PDF para reduzir memória
-            ctype = (resp.headers or {}).get("content-type", "")
-            if "application/pdf" in ctype.lower():
-                response_bucket.append(resp)
+            try:
+                a.click()
+            except ElementClickInterceptedException:
+                driver.execute_script("arguments[0].click();", a)
         except Exception:
-            pass
+            driver.execute_script("arguments[0].click();", a)
 
-    page.context.on("response", on_response)
+        # wait new tab
+        try:
+            wait.until(lambda d: len(set(d.window_handles) - before_handles) == 1)
+        except TimeoutException:
+            skipped += 1
+            continue
 
-    baixados = []
-    ausentes = []
+        new_handle = (set(driver.window_handles) - before_handles).pop()
+        main_handle = driver.current_window_handle
 
-    for code in codes:
-        print(f"[INFO] Código {code}: procurando link de AR Digital…")
-
-        # Seletor estrito no onclick do link
-        sel_strict = f"xpath=//a[contains(@class,'verArDigital') and contains(@onclick,\"verArDigital('{code}'\")]"
-        found = find_first_locator(page, [sel_strict], timeout_ms=6000)
-
-        if not found:
-            # fallback: buscar todos e filtrar atributo onclick no lado do cliente
-            sel_loose = "xpath=//a[contains(@class,'verArDigital') and contains(@onclick,'verArDigital')]"
-            found = find_first_locator(page, [sel_loose], timeout_ms=4000)
-            if found:
-                fr, sel = found
-                # Filtra pelo atributo
-                elems = fr.locator(sel)
-                count = elems.count()
-                link_idx = None
-                for i in range(count):
-                    onclick = elems.nth(i).get_attribute("onclick") or ""
-                    if code in onclick:
-                        link_idx = i
-                        break
-                if link_idx is not None:
-                    link = elems.nth(link_idx)
-                else:
-                    link = None
+        try:
+            driver.switch_to.window(new_handle)
+            time.sleep(0.8)  # let image load
+            ok = press_ctrl_s_then_enter(timeout=20)
+            if ok:
+                saved += 1
             else:
-                link = None
-        else:
-            fr, sel = found
-            link = fr.locator(sel).first
-
-        if not link:
-            print(f"[WARN] {code}: AR Digital não encontrado na listagem.")
-            ausentes.append(code)
-            continue
-
-        # Antes de clicar, limpa o balde de respostas para detectar o PDF correto
-        response_bucket.clear()
-
-        # Tenta clicar e capturar um PDF
-        try:
-            with page.expect_download(timeout=5000) as download_info:
-                link.click()
-            # Se o servidor for download direto, Playwright captura aqui:
-            dl = download_info.value
-            out_path = DOWNLOAD_DIR / f"{code}.pdf"
-            dl.save_as(str(out_path))
-            print(f"[OK] {code}: PDF salvo (download direto).")
-            baixados.append(code)
-            continue
-        except Exception:
-            # Se abrir em nova aba/visualizador, tentamos via resposta PDF
-            try:
-                link.click(timeout=5000)
-            except Exception:
-                pass
-
-        # Pequena espera para rede disparar
-        ok = wait_and_save_pdf(response_bucket, code, timeout_ms=20000)
-        if ok:
-            print(f"[OK] {code}: PDF salvo (capturado via rede).")
-            baixados.append(code)
-        else:
-            print(f"[WARN] {code}: não foi possível capturar o PDF.")
-            ausentes.append(code)
-
-        # Fecha popups, se houver
-        if len(page.context.pages) > 1:
-            for p in page.context.pages[1:]:
-                try:
-                    p.close()
-                except Exception:
-                    pass
-
-    # Resumo
-    print("\n== AR Digital baixado para ==", DOWNLOAD_DIR)
-    for c in baixados:
-        print("  ✓", c)
-    if ausentes:
-        print("\n== Sem AR Digital disponível / não baixado ==")
-        for c in ausentes:
-            print("  -", c)
-
-def main():
-    with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=HEADLESS)
-        context = browser.new_context(accept_downloads=True)
-        page = context.new_page()
-
-        try:
-            login(page)
-            # Segurança adicional: aguarda estabilizar em URL do SGD
-            try:
-                page.wait_for_url(re.compile(r"sgd"), timeout=TIMEOUT_MS)
-            except PWTimeoutError:
-                pass
-
-            page = open_consultar_varios_objetos(page)
-            pesquisar_codigos(page, CODES)
-            baixar_ars(page, CODES)
-
-        except Exception as e:
-            print(f"[ERRO] {e}")
-            dump_debug(page, "falha_geral")
+                skipped += 1
         finally:
-            context.close()
-            browser.close()
+            try:
+                driver.close()
+            except:
+                pass
+            driver.switch_to.window(main_handle)
+            time.sleep(0.2)
+    print(f"Saved: {saved}  |  Skipped: {skipped}")
 
-if __name__ == "__main__":
-    main()
+# ===== Run =====
+import traceback
+
+try:
+    wait.until(EC.presence_of_all_elements_located((By.CSS_SELECTOR, "a.verArDigital")))
+    open_and_quick_save_all_ars()
+except Exception as e:
+    print(f"[ERROR] {e}")
+    traceback.print_exc()
+
+time.sleep(1)
+driver.quit()
